@@ -8,6 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
+use axum::routing::{post, get};
 
 use qp_hd::qp44::{CoinType, Purpose, QP44, WalletRequest};
 use qp_hd::purpose::SeedSource;
@@ -183,6 +184,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/wallet/derive", post(derive_wallet_handler))
+        .route("/health", get(health_check))
         .layer(cors);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
