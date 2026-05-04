@@ -2,14 +2,12 @@ use axum::{
     extract::Json,
     http::StatusCode,
     response::Json as ResponseJson,
-    routing::post,
+    routing::{post, get},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
-use axum::routing::{post, get};
-use axum::Json;
 use serde_json::json;
 use chrono::Local;
 
