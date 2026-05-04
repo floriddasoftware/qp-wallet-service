@@ -1,141 +1,194 @@
-// src/main.rs
+use axum::{
+    extract::Json,
+    http::StatusCode,
+    response::Json as ResponseJson,
+    routing::post,
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use tower_http::cors::{Any, CorsLayer};
 
 use qp_hd::qp44::{CoinType, Purpose, QP44, WalletRequest};
-use qp_hd::purpose::{SeedSource};
-use qp_hd::pathsregistry::PathsRegistry;
-
+use qp_hd::purpose::SeedSource;
 
 use k256::SecretKey;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use ed25519_dalek::SigningKey;
-
-
 use sha2::{Sha256, Digest};
 use ripemd::Ripemd160;
 use tiny_keccak::{Keccak, Hasher};
 
-use bs58;
-use hex;
+// ── Request / Response shapes ──────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() {
-    println!("🚀 QP-44 Thermodynamic HD Wallet — Forensic Mode\n");
+#[derive(Deserialize)]
+struct DeriveRequest {
+    user_id: String,
+    coin: String, // "bitcoin" | "ethereum" | "tron" | "solana"
+}
 
-    // 1️⃣ Seed source
-    let seed = SeedSource::Raw(vec![0x11; 32]);
+#[derive(Serialize)]
+struct DeriveResponse {
+    address: String,
+    coin: String,
+}
 
-    // 2️⃣ Wallet request
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+// ── Address derivation logic ───────────────────────────────────────────────
+
+fn coin_from_str(s: &str) -> Option<CoinType> {
+    match s.to_lowercase().as_str() {
+        "bitcoin"  => Some(CoinType::Bitcoin),
+        "ethereum" => Some(CoinType::Ethereum),
+        "tron"     => Some(CoinType::Tron),
+        "solana"   => Some(CoinType::Solana),
+        _ => None,
+    }
+}
+
+fn build_seed(user_id: &str) -> Vec<u8> {
+    // Combine PROTOCOL_SEED env var with user_id to get a unique seed per user
+    let protocol_seed = std::env::var("PROTOCOL_SEED")
+        .expect("PROTOCOL_SEED must be set in .env");
+
+    let combined = format!("{}{}", protocol_seed, user_id);
+
+    // Hash to exactly 32 bytes
+    let hash = Sha256::digest(combined.as_bytes());
+    hash.to_vec()
+}
+
+fn derive_address(priv_bytes: &[u8], coin: CoinType) -> Result<String, String> {
+    match coin {
+        CoinType::Bitcoin => {
+            let secret = SecretKey::from_slice(priv_bytes)
+                .map_err(|e| format!("Invalid BTC key: {}", e))?;
+            let public = secret.public_key();
+            let pub_bytes = public.to_encoded_point(false);
+            let sha = Sha256::digest(pub_bytes.as_bytes());
+            let ripe = Ripemd160::digest(&sha);
+            let mut payload = vec![0x00];
+            payload.extend_from_slice(&ripe);
+            let checksum = Sha256::digest(&Sha256::digest(&payload));
+            payload.extend_from_slice(&checksum[..4]);
+            Ok(bs58::encode(payload).into_string())
+        }
+        CoinType::Ethereum => {
+            let secret = SecretKey::from_slice(priv_bytes)
+                .map_err(|e| format!("Invalid ETH key: {}", e))?;
+            let public = secret.public_key();
+            let uncompressed = public.to_encoded_point(false);
+            let mut keccak = Keccak::v256();
+            let mut out = [0u8; 32];
+            keccak.update(&uncompressed.as_bytes()[1..]);
+            keccak.finalize(&mut out);
+            Ok(format!("0x{}", hex::encode(&out[12..])))
+        }
+        CoinType::Tron => {
+            let secret = SecretKey::from_slice(priv_bytes)
+                .map_err(|e| format!("Invalid TRX key: {}", e))?;
+            let public = secret.public_key();
+            let uncompressed = public.to_encoded_point(false);
+            let mut keccak = Keccak::v256();
+            let mut out = [0u8; 32];
+            keccak.update(&uncompressed.as_bytes()[1..]);
+            keccak.finalize(&mut out);
+            let mut payload = vec![0x41];
+            payload.extend_from_slice(&out[12..]);
+            let checksum = Sha256::digest(&Sha256::digest(&payload));
+            payload.extend_from_slice(&checksum[..4]);
+            Ok(bs58::encode(payload).into_string())
+        }
+        CoinType::Solana => {
+            let bytes: [u8; 32] = priv_bytes
+                .try_into()
+                .map_err(|_| "Invalid SOL key length".to_string())?;
+            let signing_key = SigningKey::from_bytes(&bytes);
+            let public = signing_key.verifying_key();
+            Ok(bs58::encode(public.to_bytes()).into_string())
+        }
+    }
+}
+
+// ── Route handler ──────────────────────────────────────────────────────────
+
+async fn derive_wallet_handler(
+    Json(payload): Json<DeriveRequest>,
+) -> Result<ResponseJson<DeriveResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+
+    let coin_type = coin_from_str(&payload.coin).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse {
+                error: format!("Unknown coin: {}", payload.coin),
+            }),
+        )
+    })?;
+
+    let seed_bytes = build_seed(&payload.user_id);
+
     let request = WalletRequest {
-        seed,
+        seed: SeedSource::Raw(seed_bytes),
         purpose: Purpose::BIP44,
-        coins: vec![
-            CoinType::Bitcoin,
-            CoinType::Ethereum,
-            CoinType::Solana,
-            CoinType::Tron,
-        ],
+        coins: vec![coin_type],
         account: 0,
         index: 0,
     };
 
-    // 3️⃣ Derive wallets
-    let wallets = QP44::derive_wallet(request)
-        .expect("Wallet derivation failed");
+    let wallets = QP44::derive_wallet(request).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse {
+                error: format!("Derivation failed: {}", e),
+            }),
+        )
+    })?;
 
-    println!("🌐 Derived Wallets:\n");
+    let wallet = wallets.first().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse {
+                error: "No wallet derived".to_string(),
+            }),
+        )
+    })?;
 
-    for w in &wallets {
-        println!("Coin: {}", w.coin.name());
-    
-        // 🔐 
-        println!("Commitment: qp{}", hex::encode(w.commitment));
-        println!();
-    
-        // 🔒 
-        let priv_bytes = w.coordinate;
-    
+    let address = derive_address(&wallet.coordinate, coin_type).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse { error: e },
+        ))
+    })?;
 
+    Ok(ResponseJson(DeriveResponse {
+        address,
+        coin: payload.coin,
+    }))
+}
 
+// ── Server startup ─────────────────────────────────────────────────────────
 
-        
-        // 5️⃣ Address derivation
-        let address = match w.coin {
-            CoinType::Bitcoin => {
-                let secret = SecretKey::from_slice(&priv_bytes)
-                    .expect("Invalid BTC key");
-                let public = secret.public_key();
-                let pub_bytes = public.to_encoded_point(false);
+#[tokio::main]
+async fn main() {
+    dotenvy::dotenv().ok();
 
-                let sha = Sha256::digest(pub_bytes.as_bytes());
-                let ripe = Ripemd160::digest(&sha);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
-                let mut payload = vec![0x00]; // mainnet
-                payload.extend_from_slice(&ripe);
+    let app = Router::new()
+        .route("/wallet/derive", post(derive_wallet_handler))
+        .layer(cors);
 
-                let checksum = Sha256::digest(&Sha256::digest(&payload));
-                payload.extend_from_slice(&checksum[..4]);
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
 
-                bs58::encode(payload).into_string()
-            }
-            CoinType::Ethereum => {
-                let secret = SecretKey::from_slice(&priv_bytes)
-                    .expect("Invalid ETH key");
-                let public = secret.public_key();
-                let uncompressed = public.to_encoded_point(false);
-
-                let mut keccak = Keccak::v256();
-                let mut out = [0u8; 32];
-                keccak.update(&uncompressed.as_bytes()[1..]);
-                keccak.finalize(&mut out);
-
-                format!("0x{}", hex::encode(&out[12..]))
-            }
-            CoinType::Tron => {
-                let secret = SecretKey::from_slice(&priv_bytes)
-                    .expect("Invalid TRON key");
-                let public = secret.public_key();
-                let uncompressed = public.to_encoded_point(false);
-
-                let mut keccak = Keccak::v256();
-                let mut out = [0u8; 32];
-                keccak.update(&uncompressed.as_bytes()[1..]);
-                keccak.finalize(&mut out);
-
-                let mut payload = vec![0x41];
-                payload.extend_from_slice(&out[12..]);
-
-                let checksum = Sha256::digest(&Sha256::digest(&payload));
-                payload.extend_from_slice(&checksum[..4]);
-
-                bs58::encode(payload).into_string()
-            }
-            CoinType::Solana => {
-                let bytes: [u8; 32] = priv_bytes.as_slice()
-                    .try_into()
-                    .expect("Invalid SOL key length");
-                let signing_key = SigningKey::from_bytes(&bytes);
-                let public = signing_key.verifying_key();
-
-                let mut full_key = Vec::new();
-                full_key.extend_from_slice(&bytes);
-                full_key.extend_from_slice(public.as_bytes());
-
-                println!("  ├─ Solana Coordinate (Priv): 0x{}", hex::encode(bytes));
-                println!("  ├─ Solana 64‑byte PrivKey   : {}", hex::encode(&full_key));
-
-                bs58::encode(public.to_bytes()).into_string()
-            }
-        };
-
-        println!("Blockchain Address: {}", address);
-
-        // 6️⃣ Balance query
-        match PathsRegistry::query_balance(w.coin, &address).await {
-            Ok(balance) => println!("Balance: {}\n", balance),
-            Err(err) => println!("Error: {}\n", err),
-        }
-    }
-
-    println!("✨ Done.");
-
+    println!("🚀 Wallet service running on {}", addr);
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }

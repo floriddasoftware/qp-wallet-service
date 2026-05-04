@@ -1,8 +1,6 @@
-// src/config.rs
-
 use crate::economic_gate::BalanceProof;
 use std::env;
-use dotenv::dotenv;
+use dotenvy::dotenv;
 
 pub struct Config;
 

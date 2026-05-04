@@ -1,5 +1,3 @@
-// src/protocolvalue.rs
-
 use quantom_value::{QuantPerm, DimensionObservation, Dimension};
 use crate::protocol_id::QuantumId;
 use crate::qp44::Heritage;

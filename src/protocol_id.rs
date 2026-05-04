@@ -1,5 +1,3 @@
-// src/protocol_id.rs
-
 use quantom_value::DimensionObservation;
 
 /// Quantum Identity — the deterministic anchor for all protocol behavior.

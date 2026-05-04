@@ -1,5 +1,3 @@
-// src/pathsregistry.rs
-
 use crate::qp44::{CoinType};
 use serde_json::json;
 

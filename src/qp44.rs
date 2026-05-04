@@ -1,5 +1,5 @@
-// src/qp44.rs
-
+#![allow(unused_imports)]
+#![allow(mismatched_lifetime_syntaxes)]
 use quantom_value::{QuantPerm, Dimension, TransitionHeritage};
 use crate::purpose::{Purpose as SeedPurpose, SeedSource};
 use crate::protocolvalue::Qtm; // ✅ delegate forensic truth
