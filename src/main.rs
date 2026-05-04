@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 use axum::routing::{post, get};
+use axum::Json;
+use serde_json::json;
+use chrono::Local;
 
 use qp_hd::qp44::{CoinType, Purpose, QP44, WalletRequest};
 use qp_hd::purpose::SeedSource;
@@ -168,6 +171,14 @@ async fn derive_wallet_handler(
     Ok(ResponseJson(DeriveResponse {
         address,
         coin: payload.coin,
+    }))
+}
+
+async fn health_check() -> Json<serde_json::Value> {
+    Json(json!({
+        "success": true,
+        "message": "Server is awake",
+        "time": Local::now().format("%-m/%-d/%Y, %-I:%M:%S %p").to_string()
     }))
 }
 
