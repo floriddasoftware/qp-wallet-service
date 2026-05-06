@@ -285,7 +285,7 @@ async fn fetch_solana_balance(address: &str) -> Result<f64, String> {
     });
 
     let client = reqwest::Client::new();
-    let res = client.get(url).json(&body).send().await
+    let res = client.post(url).json(&body).send().await
         .map_err(|e| format!("Solana request failed: {}", e))?;
     let json: serde_json::Value = res.json().await
         .map_err(|e| format!("Solana parse failed: {}", e))?;
