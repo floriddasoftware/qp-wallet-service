@@ -17,7 +17,6 @@ use qp_hd::purpose::SeedSource;
 use k256::SecretKey;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
-use ed25519_dalek::SigningKey;
 use sha2::{Sha256, Digest};
 use ripemd::Ripemd160;
 use tiny_keccak::{Keccak, Hasher};
@@ -138,7 +137,7 @@ fn derive_address(priv_bytes: &[u8], coin: CoinType) -> Result<String, String> {
             let bytes: [u8; 32] = priv_bytes
                 .try_into()
                 .map_err(|_| "Invalid SOL key length".to_string())?;
-            let signing_key = SigningKey::from_bytes(&bytes);
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&bytes);
             let public = signing_key.verifying_key();
             Ok(bs58::encode(public.to_bytes()).into_string())
         }
@@ -494,6 +493,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/wallet/derive", post(derive_wallet_handler))
+        .route("/wallet/balance", post(balance_handler))
         .route("/wallet/sweep", post(sweep_handler))
         .route("/health", get(health_check))
         .layer(cors);
