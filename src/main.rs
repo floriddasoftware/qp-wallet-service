@@ -16,12 +16,27 @@ use qp_hd::purpose::SeedSource;
 
 use k256::SecretKey;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
 use ed25519_dalek::SigningKey;
 use sha2::{Sha256, Digest};
 use ripemd::Ripemd160;
 use tiny_keccak::{Keccak, Hasher};
 
 // ── Request / Response shapes ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SweepRequest {
+    user_id: String,
+    coin: String,
+    amount_usdt: f64,
+    to_address: String,
+}
+
+#[derive(Serialize)]
+struct SweepResponse {
+    tx_hash: String,
+    success: bool,
+}
 
 #[derive(Deserialize)]
 struct BalanceRequest {
@@ -212,6 +227,170 @@ async fn balance_handler(
     }
 }
 
+// ── Tron address helpers ───────────────────────────────────────────────────
+
+fn tron_address_to_hex(address: &str) -> Result<String, String> {
+    let decoded = bs58::decode(address)
+        .into_vec()
+        .map_err(|e| format!("Failed to decode Tron address: {}", e))?;
+    if decoded.len() != 25 {
+        return Err(format!("Invalid Tron address length: {}", decoded.len()));
+    }
+    Ok(hex::encode(&decoded[..21]))
+}
+
+fn encode_transfer_params(to_hex: &str, amount: u64) -> String {
+    let addr_bytes = hex::decode(to_hex).unwrap_or_default();
+    let addr_20 = if addr_bytes.len() == 21 { &addr_bytes[1..] } else { &addr_bytes };
+    let mut params = String::new();
+    params.push_str(&"0".repeat(24));
+    params.push_str(&hex::encode(addr_20));
+    params.push_str(&format!("{:064x}", amount));
+    params
+}
+
+async fn sweep_tron_usdt(
+    private_key_bytes: &[u8],
+    from_address: &str,
+    to_address: &str,
+    amount_usdt: f64,
+) -> Result<String, String> {
+    let usdt_contract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+    let amount_sun = (amount_usdt * 1_000_000.0) as u64;
+    let to_hex = tron_address_to_hex(to_address)?;
+    let from_hex = tron_address_to_hex(from_address)?;
+    let params = encode_transfer_params(&to_hex, amount_sun);
+    let api_key = std::env::var("TRONGRID_API_KEY").unwrap_or_default();
+    let tron_api = "https://api.trongrid.io";
+
+    let body = serde_json::json!({
+        "owner_address": from_hex,
+        "contract_address": usdt_contract,
+        "function_selector": "transfer(address,uint256)",
+        "parameter": params,
+        "fee_limit": 40000000,
+        "call_value": 0,
+        "visible": false
+    });
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{}/wallet/triggersmartcontract", tron_api))
+        .header("TRON-PRO-API-KEY", &api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("TronGrid request failed: {}", e))?;
+
+    let json: serde_json::Value = res.json().await
+        .map_err(|e| format!("TronGrid parse failed: {}", e))?;
+
+    if json["result"]["result"].as_bool() != Some(true) {
+        return Err(format!("Transaction creation failed: {}", json));
+    }
+
+    let tx_id = json["txid"].as_str()
+        .ok_or("No txID in response")?;
+    let raw_data_hex = json["transaction"]["raw_data_hex"].as_str()
+        .ok_or("No raw_data_hex in response")?;
+
+    // Sign the transaction
+    let tx_id_bytes = hex::decode(tx_id)
+        .map_err(|e| format!("Failed to decode txID: {}", e))?;
+
+    let signing_key = SigningKey::from_slice(private_key_bytes)
+        .map_err(|e| format!("Invalid private key: {}", e))?;
+
+    let (signature, recovery_id) = signing_key
+        .sign_prehash_recoverable(&tx_id_bytes)
+        .map_err(|e| format!("Signing failed: {}", e))?;
+
+    let mut full_sig = signature.to_bytes().to_vec();
+    full_sig.push(recovery_id.to_byte());
+    let sig_hex = hex::encode(&full_sig);
+
+    // Broadcast
+    let broadcast_body = serde_json::json!({
+        "txID": tx_id,
+        "raw_data": json["transaction"]["raw_data"],
+        "raw_data_hex": raw_data_hex,
+        "signature": [sig_hex]
+    });
+
+    let broadcast_res = client
+        .post(format!("{}/wallet/broadcasttransaction", tron_api))
+        .header("TRON-PRO-API-KEY", &api_key)
+        .json(&broadcast_body)
+        .send()
+        .await
+        .map_err(|e| format!("Broadcast failed: {}", e))?;
+
+    let broadcast_json: serde_json::Value = broadcast_res.json().await
+        .map_err(|e| format!("Broadcast parse failed: {}", e))?;
+
+    if broadcast_json["result"].as_bool() == Some(true) {
+        Ok(tx_id.to_string())
+    } else {
+        Err(format!("Broadcast failed: {}", broadcast_json))
+    }
+}
+
+// ── Sweep handler ──────────────────────────────────────────────────────────
+
+async fn sweep_handler(
+    Json(payload): Json<SweepRequest>,
+) -> Result<ResponseJson<SweepResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+
+    if payload.coin.to_lowercase() != "tron" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse {
+                error: "Only tron/USDT sweep is supported currently".to_string(),
+            }),
+        ));
+    }
+
+    let seed_bytes = build_seed(&payload.user_id);
+
+    let request = WalletRequest {
+        seed: SeedSource::Raw(seed_bytes),
+        purpose: Purpose::BIP44,
+        coins: vec![CoinType::Tron],
+        account: 0,
+        index: 0,
+    };
+
+    let wallets = QP44::derive_wallet(request).map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ResponseJson(ErrorResponse { error: format!("Derivation failed: {}", e) }),
+    ))?;
+
+    let wallet = wallets.first().ok_or_else(|| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ResponseJson(ErrorResponse { error: "No wallet derived".to_string() }),
+    ))?;
+
+    let from_address = derive_address(&wallet.coordinate, CoinType::Tron).map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ResponseJson(ErrorResponse { error: e }),
+    ))?;
+
+    let tx_hash = sweep_tron_usdt(
+        &wallet.coordinate,
+        &from_address,
+        &payload.to_address,
+        payload.amount_usdt,
+    ).await.map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ResponseJson(ErrorResponse { error: e }),
+    ))?;
+
+    Ok(ResponseJson(SweepResponse {
+        tx_hash,
+        success: true,
+    }))
+}
+
 async fn fetch_tron_balance(address: &str) -> Result<f64, String> {
     let url = format!(
         "https://apilist.tronscanapi.com/api/account/tokens?address={}&start=0&limit=20&hidden=0&show=0&sortType=0&sortBy=0",
@@ -315,7 +494,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/wallet/derive", post(derive_wallet_handler))
-        .route("/wallet/balance", post(balance_handler))
+        .route("/wallet/sweep", post(sweep_handler))
         .route("/health", get(health_check))
         .layer(cors);
 
