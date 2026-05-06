@@ -24,6 +24,20 @@ use tiny_keccak::{Keccak, Hasher};
 // ── Request / Response shapes ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
+struct BalanceRequest {
+    address: String,
+    coin: String,
+}
+
+#[derive(Serialize)]
+struct BalanceResponse {
+    address: String,
+    coin: String,
+    balance: f64,
+    balance_usd: f64,
+}
+
+#[derive(Deserialize)]
 struct DeriveRequest {
     user_id: String,
     coin: String, // "bitcoin" | "ethereum" | "tron" | "solana"
@@ -172,6 +186,114 @@ async fn derive_wallet_handler(
     }))
 }
 
+async fn balance_handler(
+    Json(payload): Json<BalanceRequest>,
+) -> Result<ResponseJson<BalanceResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+
+    let balance = match payload.coin.to_lowercase().as_str() {
+        "tron" => fetch_tron_balance(&payload.address).await,
+        "bitcoin" => fetch_bitcoin_balance(&payload.address).await,
+        "ethereum" => fetch_ethereum_balance(&payload.address).await,
+        "solana" => fetch_solana_balance(&payload.address).await,
+        _ => Err(format!("Unknown coin: {}", payload.coin)),
+    };
+
+    match balance {
+        Ok(bal) => Ok(ResponseJson(BalanceResponse {
+            address: payload.address,
+            coin: payload.coin,
+            balance: bal,
+            balance_usd: 0.0, // will wire up price feed later
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse { error: e }),
+        )),
+    }
+}
+
+async fn fetch_tron_balance(address: &str) -> Result<f64, String> {
+    let url = format!(
+        "https://apilist.tronscanapi.com/api/account/tokens?address={}&start=0&limit=20&hidden=0&show=0&sortType=0&sortBy=0",
+        address
+    );
+
+    let client = reqwest::Client::new();
+    let res = client
+        .get(&url)
+        .header("TRON-PRO-API-KEY", "")
+        .send()
+        .await
+        .map_err(|e| format!("TronScan request failed: {}", e))?;
+
+    let json: serde_json::Value = res.json().await
+        .map_err(|e| format!("TronScan parse failed: {}", e))?;
+
+    // Look for USDT TRC-20 token
+    if let Some(data) = json["data"].as_array() {
+        for token in data {
+            let name = token["tokenName"].as_str().unwrap_or("");
+            let abbr = token["tokenAbbr"].as_str().unwrap_or("");
+            if name == "Tether USD" || abbr == "USDT" {
+                let balance_str = token["quantity"].as_str().unwrap_or("0");
+                let balance: f64 = balance_str.parse().unwrap_or(0.0);
+                return Ok(balance);
+            }
+        }
+    }
+
+    Ok(0.0) // No USDT found = zero balance
+}
+
+async fn fetch_bitcoin_balance(address: &str) -> Result<f64, String> {
+    let url = format!("https://blockstream.info/api/address/{}", address);
+    let client = reqwest::Client::new();
+    let res = client.get(&url).send().await
+        .map_err(|e| format!("Bitcoin request failed: {}", e))?;
+    let json: serde_json::Value = res.json().await
+        .map_err(|e| format!("Bitcoin parse failed: {}", e))?;
+
+    let funded = json["chain_stats"]["funded_txo_sum"].as_u64().unwrap_or(0);
+    let spent  = json["chain_stats"]["spent_txo_sum"].as_u64().unwrap_or(0);
+    let balance_satoshi = funded.saturating_sub(spent);
+    Ok(balance_satoshi as f64 / 100_000_000.0) // Convert satoshi to BTC
+}
+
+async fn fetch_ethereum_balance(address: &str) -> Result<f64, String> {
+    let url = format!(
+        "https://api.etherscan.io/api?module=account&action=balance&address={}&tag=latest&apikey=YourApiKeyToken",
+        address
+    );
+    let client = reqwest::Client::new();
+    let res = client.get(&url).send().await
+        .map_err(|e| format!("Ethereum request failed: {}", e))?;
+    let json: serde_json::Value = res.json().await
+        .map_err(|e| format!("Ethereum parse failed: {}", e))?;
+
+    let wei_str = json["result"].as_str().unwrap_or("0");
+    let wei: f64 = wei_str.parse().unwrap_or(0.0);
+    Ok(wei / 1e18) // Convert wei to ETH
+}
+
+async fn fetch_solana_balance(address: &str) -> Result<f64, String> {
+    let url = "https://api.mainnet-beta.solana.com";
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [address]
+    });
+
+    let client = reqwest::Client::new();
+    let res = client.get(url).json(&body).send().await
+        .map_err(|e| format!("Solana request failed: {}", e))?;
+    let json: serde_json::Value = res.json().await
+        .map_err(|e| format!("Solana parse failed: {}", e))?;
+
+    let lamports = json["result"]["value"].as_u64().unwrap_or(0);
+    Ok(lamports as f64 / 1_000_000_000.0) // Convert lamports to SOL
+}
+
 async fn health_check() -> Json<serde_json::Value> {
     Json(json!({
         "success": true,
@@ -193,6 +315,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/wallet/derive", post(derive_wallet_handler))
+        .route("/wallet/balance", post(balance_handler))
         .route("/health", get(health_check))
         .layer(cors);
 
